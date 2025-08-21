@@ -1,0 +1,139 @@
+version: "2"
+run:
+  go: "1.24"
+  build-tags:
+    - integration
+  modules-download-mode: vendor
+  issues-exit-code: 1
+  tests: true
+linters:
+  default: all
+  disable:
+    - depguard
+    - exhaustive
+    - exhaustruct
+    - forbidigo
+    - funlen
+    - godox
+    - gomoddirectives
+    - mnd
+    - gosmopolitan
+    - nlreturn
+    - testpackage
+    - varnamelen
+    - wrapcheck
+    - wsl
+  settings:
+    cyclop:
+      max-complexity: 20
+    errcheck:
+      check-type-assertions: true
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    gocritic:
+      enabled-tags:
+        - performance
+        - diagnostic
+      settings:
+        captLocal:
+          paramsOnly: true
+        rangeValCopy:
+          sizeThreshold: 32
+    gocyclo:
+      min-complexity: 20
+    govet:
+      enable-all: true
+    lll:
+      line-length: 120
+      tab-width: 4
+    misspell:
+      locale: US
+    nakedret:
+      max-func-lines: 1
+    prealloc:
+      simple: true
+      range-loops: true
+      for-loops: false
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+            - sayRepetitiveInsteadOfStutters
+          disabled: false
+    tagalign:
+      align: true
+      order:
+        - env-namespace
+        - namespace
+        - group
+        - default
+        - env
+        - long
+        - description
+        - json
+        - yml
+        - yaml
+        - schema
+        - xml
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+        use-field-name: true
+    unparam:
+      check-exported: true
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - dupl
+          - err113
+          - gochecknoglobals
+          - gosec
+          - govet
+          - maintidx
+        path: _test.go
+      - linters:
+          - govet
+        text: declaration of "err" shadows declaration
+      - linters:
+          - lll
+        source: '^//( )?go:generate '
+      - linters:
+          - gochecknoglobals
+          - gochecknoinits
+        path: internal/metrics/.*
+      - path: (.+)\.go$
+        text: ST1000
+    paths:
+      - internal/grpc
+      - vendor
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+    gofmt:
+      simplify: true
+  exclusions:
+    generated: lax
+    paths:
+      - internal/grpc
+      - vendor
+      - third_party$
+      - builtin$
+      - examples$

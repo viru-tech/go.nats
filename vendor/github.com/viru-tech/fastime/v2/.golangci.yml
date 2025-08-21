@@ -1,0 +1,105 @@
+run:
+  timeout: 1m
+  go: "1.17" # TODO: change to 1.18 when most linters support it, see https://github.com/golangci/golangci-lint/issues/2649
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  govet:
+    check-shadowing: true
+    enable-all: true
+  golint:
+    min-confidence: 0.8
+  gofmt:
+    simplify: true
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(github.com/viru-tech)
+  gocyclo:
+    min-complexity: 20
+  cyclop:
+    max-complexity: 20
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+  depguard:
+    list-type: blacklist
+    include-go-root: false
+  misspell:
+    locale: US
+  lll:
+    line-length: 150
+    tab-width: 4
+  unused:
+    check-exported: false
+  unparam:
+    check-exported: true
+  nakedret:
+    max-func-lines: 1
+  prealloc:
+    simple: true
+    range-loops: true
+    for-loops: false
+  gocritic:
+    enabled-tags:
+      - performance
+      - diagnostic
+    settings:
+      captLocal:
+        paramsOnly: true
+      rangeValCopy:
+        sizeThreshold: 32
+  tagliatelle:
+    case:
+      use-field-name: true
+      rules:
+        json: snake
+
+linters:
+  enable-all: true
+  fast: false
+  disable:
+    - wsl
+    - funlen
+    - wrapcheck
+    - exhaustivestruct
+    - exhaustive
+    - interfacer
+    - testpackage
+    - nlreturn
+    - gomnd
+    - forbidigo
+    - godox
+    - maligned
+    - golint
+    - scopelint
+    - gomoddirectives
+    - varnamelen
+    - exhaustruct
+    - paralleltest
+    - ireturn
+    - godot
+    - gochecknoinits
+    - forcetypeassert
+
+issues:
+  exclude-rules:
+    - source: "^//\\s*go:generate\\s"
+      linters: [ lll ]
+    - source: "(noinspection|TODO)"
+      linters: [ godot ]
+    - source: "//noinspection"
+      linters: [ gocritic ]
+    - source: "^\\s+if _, ok := err\\.\\([^.]+\\.InternalError\\); ok {"
+      linters: [ errorlint ]
+    - path: "_test\\.go"
+      linters:
+        - bodyclose
+        - dupl
+        - funlen
+        - goconst
+        - gosec
+        - noctx
+        - wrapcheck
