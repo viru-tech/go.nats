@@ -70,3 +70,11 @@ func WithPullThresholdMessages(threshold int) ConsumerOption {
 		c.pullThresholdMessages = threshold
 	}
 }
+
+// WithMaxWaiting sets the maximum number of waiting pull requests.
+// Defaults to 512.
+func WithMaxWaiting(maxWaiting int) ConsumerOption {
+	return func(c *Consumer) {
+		c.maxWaiting = maxWaiting
+	}
+}
