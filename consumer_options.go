@@ -3,6 +3,7 @@ package nats
 import (
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -68,5 +69,21 @@ func WithPullMaxMessages(maxMessages int) ConsumerOption {
 func WithPullThresholdMessages(threshold int) ConsumerOption {
 	return func(c *Consumer) {
 		c.pullThresholdMessages = threshold
+	}
+}
+
+// WithMaxWaiting sets the maximum number of waiting pull requests.
+// Defaults to 512.
+func WithMaxWaiting(maxWaiting int) ConsumerOption {
+	return func(c *Consumer) {
+		c.maxWaiting = maxWaiting
+	}
+}
+
+// WithAckPolicy sets consumer ack policy.
+// Defaults to AckExplicit.
+func WithAckPolicy(policy jetstream.AckPolicy) ConsumerOption {
+	return func(c *Consumer) {
+		c.ackPolicy = policy
 	}
 }

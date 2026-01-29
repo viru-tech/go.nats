@@ -23,6 +23,8 @@ const (
 	defaultPullMaxMessages       = 500
 	dfaultPullExpiry             = 30 * time.Second
 	defaultPullThresholdMessages = 250
+	defaultMaxWaiting            = 512
+	defaultAckPolicy             = jetstream.AckExplicitPolicy
 )
 
 // Handler function for message processing.
@@ -45,6 +47,8 @@ type Consumer struct {
 	maxAckPending         int
 	pullMaxMessages       int
 	pullThresholdMessages int
+	maxWaiting            int
+	ackPolicy             jetstream.AckPolicy
 	compression           bool
 }
 
@@ -59,6 +63,8 @@ func NewConsumer(urls []string, subject, durable string, opts ...ConsumerOption)
 		pullMaxMessages:       defaultPullMaxMessages,
 		pullExpiry:            dfaultPullExpiry,
 		pullThresholdMessages: defaultPullThresholdMessages,
+		maxWaiting:            defaultMaxWaiting,
+		ackPolicy:             defaultAckPolicy,
 	}
 	for i := range opts {
 		opts[i](consumer)
@@ -115,6 +121,8 @@ func (c *Consumer) Run(ctx context.Context, handler Handler) error {
 		Durable:       c.durable,
 		AckWait:       c.ackWait,
 		MaxAckPending: c.maxAckPending,
+		MaxWaiting:    c.maxWaiting,
+		AckPolicy:     c.ackPolicy,
 	})
 	if err != nil {
 		return err
