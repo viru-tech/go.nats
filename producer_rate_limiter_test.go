@@ -86,15 +86,36 @@ func TestProducerProduceJSONAsync_AppliesBackpressure(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
+type fauxStream struct {
+	jetstream.Stream
+}
+
+func (fauxStream) Info(_ context.Context, _ ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
+	return &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxBytes: 100},
+		State:  jetstream.StreamState{Bytes: 85},
+	}, nil
+}
+
 func TestApplyBackpressure_StopsOnCancel(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mock := NewMockJetStream(ctrl)
+
+	mock.EXPECT().Stream(gomock.Any(), "ORDERS").Return(
+		jetstream.Stream(fauxStream{}),
+		nil,
+	)
+
 	p := &Producer{
 		logger: zaptest.NewLogger(t),
 		backPressure: map[string]*backpressureController{
 			"ORDERS": {},
 		},
+		js: mock,
 	}
 
 	p.applyBackpressure(ctx)

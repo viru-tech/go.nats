@@ -131,6 +131,8 @@ func (p *Producer) throttle(ctx context.Context, subject string) error {
 // callbacks when throttling starts or the stream reaches 100% fill.
 func (p *Producer) applyBackpressure(ctx context.Context) {
 	p.backPressureWG.Go(func() {
+		p.calculateBackpressureDelay(ctx)
+
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -138,29 +140,33 @@ func (p *Producer) applyBackpressure(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				for streamName, ctrl := range p.backPressure {
-					delay, isThrottling, isStreamFull, err := p.computeDelay(ctx, streamName, ctrl.config)
-					if err != nil {
-						p.logger.Error("failed to compute backpressure delay",
-							zap.String("stream", streamName),
-							zap.Error(err),
-						)
-						continue
-					}
-					ctrl.setDelay(delay)
-
-					if isThrottling != ctrl.wasThrottling && ctrl.config.OnThrottleStateChange != nil {
-						ctrl.config.OnThrottleStateChange(isThrottling)
-					}
-					if isStreamFull != ctrl.wasStreamFull && ctrl.config.OnMaxDelayStateChange != nil {
-						ctrl.config.OnMaxDelayStateChange(isStreamFull)
-					}
-					ctrl.wasThrottling = isThrottling
-					ctrl.wasStreamFull = isStreamFull
-				}
+				p.calculateBackpressureDelay(ctx)
 			}
 		}
 	})
+}
+
+func (p *Producer) calculateBackpressureDelay(ctx context.Context) {
+	for streamName, ctrl := range p.backPressure {
+		delay, isThrottling, isStreamFull, err := p.computeDelay(ctx, streamName, ctrl.config)
+		if err != nil {
+			p.logger.Error("failed to compute backpressure delay",
+				zap.String("stream", streamName),
+				zap.Error(err),
+			)
+			continue
+		}
+		ctrl.setDelay(delay)
+
+		if isThrottling != ctrl.wasThrottling && ctrl.config.OnThrottleStateChange != nil {
+			ctrl.config.OnThrottleStateChange(isThrottling)
+		}
+		if isStreamFull != ctrl.wasStreamFull && ctrl.config.OnMaxDelayStateChange != nil {
+			ctrl.config.OnMaxDelayStateChange(isStreamFull)
+		}
+		ctrl.wasThrottling = isThrottling
+		ctrl.wasStreamFull = isStreamFull
+	}
 }
 
 // computeDelay fetches stream state and returns the delay to inject before the next
@@ -197,20 +203,25 @@ func computeThrottleStateFromStreamInfo(
 
 	if cfg.ThresholdBytesPercent > 0 && info.Config.MaxBytes > 0 {
 		fill := float64(info.State.Bytes) / float64(info.Config.MaxBytes)
-		if fill >= 1.0 {
-			isStreamFull = true
+		if fill >= maxDelayAt {
+			return cfg.MaxDelay, true, true
 		}
-		if f := throttleFactor(fill, float64(cfg.ThresholdBytesPercent)/100.0, maxDelayAt); f > factor {
-			factor = f
-		}
+
+		factor, isStreamFull = throttleFactor(fill, float64(cfg.ThresholdBytesPercent)/100.0, maxDelayAt)
 	}
-	if cfg.ThresholdMsgsPercent > 0 && info.Config.MaxMsgs > 0 {
+
+	if !isStreamFull && cfg.ThresholdMsgsPercent > 0 && info.Config.MaxMsgs > 0 {
 		fill := float64(info.State.Msgs) / float64(info.Config.MaxMsgs)
-		if fill >= 1.0 {
-			isStreamFull = true
+		if fill >= maxDelayAt {
+			return cfg.MaxDelay, true, true
 		}
-		if f := throttleFactor(fill, float64(cfg.ThresholdMsgsPercent)/100.0, maxDelayAt); f > factor {
+		f, isFull := throttleFactor(fill, float64(cfg.ThresholdMsgsPercent)/100.0, maxDelayAt)
+		if f > factor {
 			factor = f
+		}
+
+		if isFull {
+			isStreamFull = true
 		}
 	}
 
@@ -220,18 +231,20 @@ func computeThrottleStateFromStreamInfo(
 	return delay, isThrottling, isStreamFull
 }
 
-// throttleFactor returns a value in [0, 1] representing how much to throttle.
+// throttleFactor returns a value in [0, 1] representing how much to throttle and returns (1, true)
+// if stream has reached maxDelayAt.
 // Returns 0 at or below threshold, grows quadratically to 1 at maxDelayAt,
 // and stays clamped at 1 beyond that.
 // The quadratic curve stays gentle near the threshold and steepens as fill
 // approaches maxDelayAt, giving producers an early warning before hitting MaxDelay.
-func throttleFactor(fill, threshold, maxDelayAt float64) float64 {
+func throttleFactor(fill, threshold, maxDelayAt float64) (float64, bool) {
 	if fill <= threshold || threshold >= maxDelayAt {
-		return 0
+		return 0, false
 	}
 	if fill >= maxDelayAt {
-		return 1.0
+		return 1.0, true
 	}
 	t := (fill - threshold) / (maxDelayAt - threshold) // normalised to [0, 1]
-	return t * t
+
+	return t * t, false
 }
