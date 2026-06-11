@@ -14,27 +14,151 @@ import (
 func TestComputeThrottleStateFromStreamInfo_StreamFullOnlyAtCapacity(t *testing.T) {
 	t.Parallel()
 
-	cfg := BackpressureStreamConfig{
-		ThresholdBytesPercent: 80,
-		MaxDelayAtPercent:     95,
-		MaxDelay:              time.Second,
+	ctrl := &backpressureController{
+		config: BackpressureStreamConfig{
+			ThresholdBytesPercent: 80,
+			MaxDelay:              time.Second,
+			MaxBytes:              100,
+		},
 	}
 
-	delay, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo(&jetstream.StreamInfo{
-		Config: jetstream.StreamConfig{MaxBytes: 100},
+	delay, _, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxBytes: 999},
 		State:  jetstream.StreamState{Bytes: 85},
-	}, cfg)
+	}, ctrl)
 	require.True(t, isThrottling)
 	require.False(t, isStreamFull)
 	require.Positive(t, delay)
 
-	delay, isThrottling, isStreamFull = computeThrottleStateFromStreamInfo(&jetstream.StreamInfo{
-		Config: jetstream.StreamConfig{MaxBytes: 100},
+	delay, _, isThrottling, isStreamFull = computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxBytes: 999},
 		State:  jetstream.StreamState{Bytes: 100},
-	}, cfg)
+	}, ctrl)
 	require.True(t, isThrottling)
 	require.True(t, isStreamFull)
-	require.Equal(t, cfg.MaxDelay, delay)
+	require.Equal(t, ctrl.config.MaxDelay, delay)
+}
+
+func TestThrottleFactor_DefaultEaseInOutStartsSlowerThanLinear(t *testing.T) {
+	t.Parallel()
+
+	fill := 0.84
+	threshold := 0.80
+
+	easeInOut := throttleFactor(fill, threshold)
+	linear := (fill - threshold) / (1 - threshold)
+
+	require.Greater(t, easeInOut, 0.0)
+	require.Less(t, easeInOut, linear)
+}
+
+func TestComputeThrottleStateFromStreamInfo_UsesConfiguredMaxesInThrottlePolicy(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &backpressureController{
+		config: BackpressureStreamConfig{
+			MaxDelay:              time.Second,
+			ThresholdBytesPercent: 80,
+			MaxBytes:              200,
+			ThrottlePolicy: func(input ThrottlePolicyInput) ThrottlePolicyResult {
+				require.Equal(t, "ORDERS", input.StreamName)
+				require.InDelta(t, 0.425, input.BytesFillRatio, 0.0001)
+				require.InDelta(t, 0.80, input.ThresholdBytesRatio, 0.0001)
+				return ThrottlePolicyResult{Factor: 0.25}
+			},
+		},
+	}
+
+	delay, factor, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxBytes: 100},
+		State:  jetstream.StreamState{Bytes: 85},
+	}, ctrl)
+	require.True(t, isThrottling)
+	require.False(t, isStreamFull)
+	require.Equal(t, 250*time.Millisecond, delay)
+	require.InDelta(t, 0.25, factor, 0.0001)
+}
+
+func TestComputeThrottleStateFromStreamInfo_UsesConfiguredMaxMsgs(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &backpressureController{
+		config: BackpressureStreamConfig{
+			MaxDelay:             time.Second,
+			ThresholdMsgsPercent: 80,
+			MaxMsgs:              200,
+		},
+	}
+
+	delay, factor, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxMsgs: 100},
+		State:  jetstream.StreamState{Msgs: 170},
+	}, ctrl)
+	require.True(t, isThrottling)
+	require.False(t, isStreamFull)
+	require.Positive(t, delay)
+	require.Positive(t, factor)
+}
+
+func TestComputeThrottleStateFromStreamInfo_DisablesBytesWithoutConfiguredMax(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &backpressureController{
+		config: BackpressureStreamConfig{
+			MaxDelay:              time.Second,
+			ThresholdBytesPercent: 80,
+		},
+	}
+
+	delay, factor, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxBytes: 100},
+		State:  jetstream.StreamState{Bytes: 95},
+	}, ctrl)
+	require.Zero(t, delay)
+	require.Zero(t, factor)
+	require.False(t, isThrottling)
+	require.False(t, isStreamFull)
+}
+
+func TestComputeThrottleStateFromStreamInfo_DisablesMsgsWithoutConfiguredMax(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &backpressureController{
+		config: BackpressureStreamConfig{
+			MaxDelay:             time.Second,
+			ThresholdMsgsPercent: 80,
+		},
+	}
+
+	delay, factor, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxMsgs: 100},
+		State:  jetstream.StreamState{Msgs: 95},
+	}, ctrl)
+	require.Zero(t, delay)
+	require.Zero(t, factor)
+	require.False(t, isThrottling)
+	require.False(t, isStreamFull)
+}
+
+func TestComputeThrottleStateFromStreamInfo_IgnoresStreamConfigLimits(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &backpressureController{
+		config: BackpressureStreamConfig{
+			MaxDelay:              time.Second,
+			ThresholdBytesPercent: 80,
+			MaxBytes:              100,
+		},
+	}
+
+	delay, factor, isThrottling, isStreamFull := computeThrottleStateFromStreamInfo("ORDERS", &jetstream.StreamInfo{
+		Config: jetstream.StreamConfig{MaxBytes: 1000},
+		State:  jetstream.StreamState{Bytes: 850},
+	}, ctrl)
+	require.True(t, isThrottling)
+	require.True(t, isStreamFull)
+	require.Equal(t, time.Second, delay)
+	require.InDelta(t, 1.0, factor, 0.0001)
 }
 
 func TestProducerThrottle_UsesStreamNameBySubject(t *testing.T) {
