@@ -88,6 +88,19 @@ func WithFallbackChain(ff ...Fallback) ProducerOption {
 	}
 }
 
+// WithBackPressureConfig sets per-stream producer backpressure thresholds and callbacks.
+func WithBackPressureConfig(config BackpressureConfig) ProducerOption {
+	return func(p *Producer) {
+		controllers := make(map[string]*backpressureController)
+		for stream := range config {
+			controllers[stream] = &backpressureController{
+				config: config[stream],
+			}
+		}
+		p.backPressure = controllers
+	}
+}
+
 // FSFallbackOption configures FSFallback.
 type FSFallbackOption func(f *FSFallback)
 

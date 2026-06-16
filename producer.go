@@ -23,11 +23,11 @@ type ProducerNats interface {
 	// Closer closes the NATS connection.
 	io.Closer
 	// ProduceJSON publishes a JSON message to the specified subject.
-	ProduceJSON(ctx context.Context, subject string, v interface{}) error
+	ProduceJSON(ctx context.Context, subject string, v any) error
 	// ProduceBytes publishes a []bytes to the specified subject.
 	ProduceBytes(ctx context.Context, subject string, data []byte) error
 	// ProduceJSONAsync publishes async a JSON message to the specified subject.
-	ProduceJSONAsync(subject string, v interface{}) error
+	ProduceJSONAsync(subject string, v any) error
 }
 
 // ErrorHandler defines the error function that will be called when error is received.
@@ -40,20 +40,25 @@ type pubAckWithTime struct {
 
 // Producer is a NATS Producer that publishes messages to subjects.
 type Producer struct {
-	logger *zap.Logger
-	nc     *nats.Conn
-	js     jetstream.JetStream
+	logger          *zap.Logger
+	nc              *nats.Conn
+	backPressure    map[string]*backpressureController
+	js              jetstream.JetStream
+	bpCancel        context.CancelFunc
+	errorHandler    ErrorHandler
+	fallback        Fallback
+	ackCh           chan pubAckWithTime
+	fallbackCh      chan fallbackRequest
+	fastime         fastime.Fastime
+	streamBySubject sync.Map
 
-	errorHandler ErrorHandler
-	fallback     Fallback
-	ackCh        chan pubAckWithTime
-	fallbackCh   chan fallbackRequest
-	fastime      fastime.Fastime
+	fallbackTimeout time.Duration
+	publishTimeout  time.Duration
 
-	ackWG               sync.WaitGroup
-	fallbackWG          sync.WaitGroup
-	fallbackTimeout     time.Duration
-	publishTimeout      time.Duration
+	ackWG          sync.WaitGroup
+	fallbackWG     sync.WaitGroup
+	backPressureWG sync.WaitGroup
+
 	ackBufferSize       int
 	fallbackBufferSize  int
 	ackConcurrency      int
@@ -114,6 +119,12 @@ func NewProducer(urls []string, opts ...ProducerOption) (*Producer, error) {
 	p.ackCh = make(chan pubAckWithTime, p.ackBufferSize)
 	p.fallbackCh = make(chan fallbackRequest, p.fallbackBufferSize)
 
+	if len(p.backPressure) > 0 {
+		backpressureCtx, cancel := context.WithCancel(context.Background())
+		p.bpCancel = cancel
+		p.applyBackpressure(backpressureCtx)
+	}
+
 	p.runAckWorker()
 	p.runFallbackWorker()
 
@@ -122,6 +133,10 @@ func NewProducer(urls []string, opts ...ProducerOption) (*Producer, error) {
 
 // Close closes the NATS connection.
 func (p *Producer) Close() error { //nolint:unparam
+	if p.bpCancel != nil {
+		p.bpCancel()
+		p.backPressureWG.Wait()
+	}
 	p.js.CleanupPublisher()
 	if p.nc != nil {
 		p.nc.Close()
@@ -134,7 +149,7 @@ func (p *Producer) Close() error { //nolint:unparam
 }
 
 // ProduceJSON publishes a JSON message to the specified subject.
-func (p *Producer) ProduceJSON(ctx context.Context, subject string, v interface{}) error {
+func (p *Producer) ProduceJSON(ctx context.Context, subject string, v any) error {
 	data, err := jsoniter.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data to JSON: %w", err)
@@ -144,12 +159,16 @@ func (p *Producer) ProduceJSON(ctx context.Context, subject string, v interface{
 }
 
 // ProduceJSONAsync publishes a JSON message to the specified subject asynchronously.
-func (p *Producer) ProduceJSONAsync(subject string, v interface{}) error {
+func (p *Producer) ProduceJSONAsync(subject string, v any) error {
 	var err error
 
 	data, err := jsoniter.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("failed to marshal data to JSON: %w", err)
+	}
+
+	if err := p.throttle(context.Background(), subject); err != nil {
+		return err
 	}
 
 	pubAckFuture, err := p.js.PublishAsync(subject, data)
@@ -174,6 +193,10 @@ func (p *Producer) ProduceJSONAsync(subject string, v interface{}) error {
 
 // ProduceBytes publishes a []byte to the specified subject synchronously.
 func (p *Producer) ProduceBytes(ctx context.Context, subject string, data []byte) error {
+	if err := p.throttle(ctx, subject); err != nil {
+		return err
+	}
+
 	pubCtx := ctx
 	if p.publishTimeout > 0 {
 		var pubCancel context.CancelFunc
@@ -217,10 +240,7 @@ func (p *Producer) runAckWorker() {
 		return
 	}
 	for range p.ackConcurrency {
-		p.ackWG.Add(1)
-		go func() {
-			defer p.ackWG.Done()
-
+		p.ackWG.Go(func() {
 			for req := range p.ackCh {
 				select {
 				case ack := <-req.ackFuture.Ok():
@@ -252,7 +272,7 @@ func (p *Producer) runAckWorker() {
 					}
 				}
 			}
-		}()
+		})
 	}
 }
 
@@ -262,10 +282,7 @@ func (p *Producer) runFallbackWorker() {
 	}
 
 	for range p.fallbackConcurrency {
-		p.fallbackWG.Add(1)
-		go func() {
-			defer p.fallbackWG.Done()
-
+		p.fallbackWG.Go(func() {
 			for req := range p.fallbackCh {
 				ctx, cancel := context.WithTimeout(context.Background(), p.fallbackTimeout)
 				err := p.fallback.SaveMessage(ctx, req.subject, req.data)
@@ -282,6 +299,6 @@ func (p *Producer) runFallbackWorker() {
 					}
 				}
 			}
-		}()
+		})
 	}
 }

@@ -61,11 +61,7 @@ func (f *FSResend) Close() error { //nolint:unparam
 
 // Run starts background retry goroutine.
 func (f *FSResend) Run() {
-	f.wg.Add(1)
-
-	go func() {
-		defer f.wg.Done()
-
+	f.wg.Go(func() {
 		t := time.NewTicker(f.retryInterval)
 		defer t.Stop()
 
@@ -79,7 +75,7 @@ func (f *FSResend) Run() {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // Resend immediately run scan fallback directory and try to send messages.
