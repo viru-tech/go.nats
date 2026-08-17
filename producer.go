@@ -2,9 +2,11 @@ package nats
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -33,10 +35,31 @@ type ProducerNats interface {
 // ErrorHandler defines the error function that will be called when error is received.
 type ErrorHandler func(err error, subject string, data []byte)
 
-type pubAckWithTime struct {
-	ackFuture jetstream.PubAckFuture
-	sentTime  time.Time
+// AsyncPublishOutcome classifies terminal async publish results.
+type AsyncPublishOutcome string
+
+const (
+	// AsyncPublishOutcomeAcked indicates the server confirmed the publish.
+	AsyncPublishOutcomeAcked AsyncPublishOutcome = "acked"
+	// AsyncPublishOutcomeFailed indicates the publish is known to have failed.
+	AsyncPublishOutcomeFailed AsyncPublishOutcome = "failed"
+	// AsyncPublishOutcomeUnknown indicates the payload may have reached the server,
+	// but the client cannot determine the final state safely.
+	AsyncPublishOutcomeUnknown AsyncPublishOutcome = "unknown"
+)
+
+var errProducerClosed = errors.New("producer is closed")
+
+// AsyncPublishResult describes one terminal async publish result.
+type AsyncPublishResult struct {
+	Outcome AsyncPublishOutcome
+	Err     error
+	Subject string
+	Data    []byte
 }
+
+// AsyncOutcomeHandler receives structured async publish results.
+type AsyncOutcomeHandler func(result AsyncPublishResult)
 
 // Producer is a NATS Producer that publishes messages to subjects.
 type Producer struct {
@@ -46,22 +69,25 @@ type Producer struct {
 	js              jetstream.JetStream
 	bpCancel        context.CancelFunc
 	errorHandler    ErrorHandler
+	asyncHandler    AsyncOutcomeHandler
 	fallback        Fallback
-	ackCh           chan pubAckWithTime
 	fallbackCh      chan fallbackRequest
 	fastime         fastime.Fastime
 	streamBySubject sync.Map
+	closeOnce       sync.Once
+	closed          atomic.Bool
+	closedCh        chan struct{}
 
 	fallbackTimeout time.Duration
 	publishTimeout  time.Duration
+	asyncAckTimeout time.Duration
+	asyncMaxPending int
 
-	ackWG          sync.WaitGroup
+	asyncWG        sync.WaitGroup
 	fallbackWG     sync.WaitGroup
 	backPressureWG sync.WaitGroup
 
-	ackBufferSize       int
 	fallbackBufferSize  int
-	ackConcurrency      int
 	fallbackConcurrency int
 	compression         bool
 }
@@ -78,9 +104,9 @@ func NewProducer(urls []string, opts ...ProducerOption) (*Producer, error) {
 		logger:              zap.NewNop(),
 		fallbackTimeout:     time.Millisecond * 500,
 		publishTimeout:      5 * time.Second,
-		ackBufferSize:       10,
+		asyncAckTimeout:     5 * time.Second,
+		asyncMaxPending:     10,
 		fallbackBufferSize:  10,
-		ackConcurrency:      1,
 		fallbackConcurrency: 1,
 		fastime:             fastime.New().StartTimerD(context.Background(), time.Millisecond*5),
 	}
@@ -110,14 +136,22 @@ func NewProducer(urls []string, opts ...ProducerOption) (*Producer, error) {
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	p.js, err = jetstream.New(p.nc)
+	jsOpts := make([]jetstream.JetStreamOpt, 0, 2)
+	if p.asyncAckTimeout > 0 {
+		jsOpts = append(jsOpts, jetstream.WithPublishAsyncTimeout(p.asyncAckTimeout))
+	}
+	if p.asyncMaxPending > 0 {
+		jsOpts = append(jsOpts, jetstream.WithPublishAsyncMaxPending(p.asyncMaxPending))
+	}
+
+	p.js, err = jetstream.New(p.nc, jsOpts...)
 	if err != nil {
 		p.nc.Close()
 		return nil, fmt.Errorf("failed to create JetStream instance: %w", err)
 	}
 
-	p.ackCh = make(chan pubAckWithTime, p.ackBufferSize)
 	p.fallbackCh = make(chan fallbackRequest, p.fallbackBufferSize)
+	p.closedCh = make(chan struct{})
 
 	if len(p.backPressure) > 0 {
 		backpressureCtx, cancel := context.WithCancel(context.Background())
@@ -125,7 +159,6 @@ func NewProducer(urls []string, opts ...ProducerOption) (*Producer, error) {
 		p.applyBackpressure(backpressureCtx)
 	}
 
-	p.runAckWorker()
 	p.runFallbackWorker()
 
 	return p, nil
@@ -133,6 +166,12 @@ func NewProducer(urls []string, opts ...ProducerOption) (*Producer, error) {
 
 // Close closes the NATS connection.
 func (p *Producer) Close() error { //nolint:unparam
+	p.closed.Store(true)
+	p.closeOnce.Do(func() {
+		if p.closedCh != nil {
+			close(p.closedCh)
+		}
+	})
 	if p.bpCancel != nil {
 		p.bpCancel()
 		p.backPressureWG.Wait()
@@ -141,8 +180,7 @@ func (p *Producer) Close() error { //nolint:unparam
 	if p.nc != nil {
 		p.nc.Close()
 	}
-	close(p.ackCh)
-	p.ackWG.Wait()
+	p.asyncWG.Wait()
 	close(p.fallbackCh)
 	p.fallbackWG.Wait()
 	return nil
@@ -171,23 +209,29 @@ func (p *Producer) ProduceJSONAsync(subject string, v any) error {
 		return err
 	}
 
+	if p.closed.Load() {
+		p.logger.Warn("async publish rejected because producer is closing",
+			zap.String("subject", subject),
+		)
+		return errProducerClosed
+	}
+
+	start := p.fastime.Now()
 	pubAckFuture, err := p.js.PublishAsync(subject, data)
 	if err != nil {
 		incProducerSentCounter(subject, true)
+		observeProducerAckWaitingTime(subject, true, time.Since(start))
 
-		if p.fallback != nil {
-			p.fallbackCh <- fallbackRequest{
-				subject: subject,
-				data:    data,
-			}
-		}
+		p.handleAsyncFailure(AsyncPublishResult{
+			Outcome: AsyncPublishOutcomeFailed,
+			Err:     err,
+			Subject: subject,
+			Data:    data,
+		}, start)
 		return err
 	}
 
-	p.ackCh <- pubAckWithTime{
-		ackFuture: pubAckFuture,
-		sentTime:  p.fastime.Now(),
-	}
+	p.trackAsyncPublish(pubAckFuture, start)
 	return nil
 }
 
@@ -235,45 +279,97 @@ func (p *Producer) SaveMessage(ctx context.Context, subject string, msg []byte) 
 	return p.ProduceBytes(ctx, subject, msg)
 }
 
-func (p *Producer) runAckWorker() {
-	if p.ackCh == nil {
+func (p *Producer) trackAsyncPublish(pubAckFuture jetstream.PubAckFuture, sentTime time.Time) {
+	subject := pubAckFuture.Msg().Subject
+	incAsyncPublishPending(subject, 1)
+	p.asyncWG.Go(func() {
+		defer incAsyncPublishPending(subject, -1)
+
+		select {
+		case <-pubAckFuture.Ok():
+			incProducerSentCounter(subject, false)
+			observeProducerAckWaitingTime(subject, false, time.Since(sentTime))
+			incAsyncPublishOutcomeCounter(subject, AsyncPublishOutcomeAcked)
+			observeAsyncPublishResolutionTime(subject, AsyncPublishOutcomeAcked, time.Since(sentTime))
+			p.handleAsyncResult(AsyncPublishResult{
+				Outcome: AsyncPublishOutcomeAcked,
+				Subject: subject,
+				Data:    pubAckFuture.Msg().Data,
+			})
+
+		case err := <-pubAckFuture.Err():
+			outcome := classifyAsyncPublishOutcome(err)
+			result := AsyncPublishResult{
+				Outcome: outcome,
+				Err:     err,
+				Subject: subject,
+				Data:    pubAckFuture.Msg().Data,
+			}
+			p.handleAsyncFailure(result, sentTime)
+		}
+	})
+}
+
+func classifyAsyncPublishOutcome(err error) AsyncPublishOutcome {
+	switch {
+	case err == nil:
+		return AsyncPublishOutcomeAcked
+	case errors.Is(err, jetstream.ErrAsyncPublishTimeout):
+		return AsyncPublishOutcomeUnknown
+	case errors.Is(err, nats.ErrDisconnected):
+		return AsyncPublishOutcomeUnknown
+	case errors.Is(err, nats.ErrConnectionClosed):
+		return AsyncPublishOutcomeUnknown
+	default:
+		return AsyncPublishOutcomeFailed
+	}
+}
+
+func (p *Producer) handleAsyncFailure(result AsyncPublishResult, sentTime time.Time) {
+	isError := result.Outcome != AsyncPublishOutcomeAcked
+	incProducerSentCounter(result.Subject, isError)
+	observeProducerAckWaitingTime(result.Subject, isError, time.Since(sentTime))
+	incAsyncPublishOutcomeCounter(result.Subject, result.Outcome)
+	observeAsyncPublishResolutionTime(result.Subject, result.Outcome, time.Since(sentTime))
+
+	switch result.Outcome {
+	case AsyncPublishOutcomeUnknown:
+		if !p.closed.Load() {
+			p.logger.Warn("async publish result is unknown; fallback skipped",
+				zap.String("subject", result.Subject),
+				zap.Error(result.Err),
+			)
+		}
+	case AsyncPublishOutcomeFailed:
+		p.logger.Error("async publish failed",
+			zap.String("subject", result.Subject),
+			zap.Error(result.Err),
+		)
+		if p.fallback != nil {
+			p.fallbackCh <- fallbackRequest{
+				subject: result.Subject,
+				data:    result.Data,
+			}
+		}
+	}
+
+	p.handleAsyncResult(result)
+}
+
+func (p *Producer) handleAsyncResult(result AsyncPublishResult) {
+	if p.asyncHandler != nil {
+		p.asyncHandler(result)
+	}
+
+	if result.Outcome == AsyncPublishOutcomeAcked || p.errorHandler == nil || result.Err == nil {
 		return
 	}
-	for range p.ackConcurrency {
-		p.ackWG.Go(func() {
-			for req := range p.ackCh {
-				select {
-				case ack := <-req.ackFuture.Ok():
-					p.logger.Debug("message acknowledged",
-						zap.String("stream", ack.Stream),
-						zap.String("subject", req.ackFuture.Msg().Subject),
-						zap.Uint64("sequence", ack.Sequence),
-					)
-					incProducerSentCounter(req.ackFuture.Msg().Subject, false)
-					observeProducerAckWaitingTime(req.ackFuture.Msg().Subject, false, time.Since(req.sentTime))
 
-				case err := <-req.ackFuture.Err():
-					p.logger.Error("failed to publish",
-						zap.String("subject", req.ackFuture.Msg().Subject),
-						zap.Error(err),
-					)
-					incProducerSentCounter(req.ackFuture.Msg().Subject, true)
-					observeProducerAckWaitingTime(req.ackFuture.Msg().Subject, true, time.Since(req.sentTime))
-					if p.errorHandler != nil {
-						handlerErr := fmt.Errorf("failed to publish: %w", err)
-						p.errorHandler(handlerErr, req.ackFuture.Msg().Subject, req.ackFuture.Msg().Data)
-					}
-
-					if p.fallback != nil {
-						p.fallbackCh <- fallbackRequest{
-							subject: req.ackFuture.Msg().Subject,
-							data:    req.ackFuture.Msg().Data,
-						}
-					}
-				}
-			}
-		})
-	}
+	p.errorHandler(
+		fmt.Errorf("async publish %s: %w", result.Outcome, result.Err),
+		result.Subject,
+		result.Data,
+	)
 }
 
 func (p *Producer) runFallbackWorker() {

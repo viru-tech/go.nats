@@ -20,6 +20,7 @@ import (
 type MockFallback struct {
 	ctrl     *gomock.Controller
 	recorder *MockFallbackMockRecorder
+	isgomock struct{}
 }
 
 // MockFallbackMockRecorder is the mock recorder for MockFallback.

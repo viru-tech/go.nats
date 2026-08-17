@@ -1,4 +1,4 @@
-// Copyright 2022-2025 The NATS Authors
+// Copyright 2022-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -58,6 +58,11 @@ const (
 	JSErrCodeStreamWrongLastSequence ErrorCode = 10071
 	JSErrCodeJetStreamNotEnabled     ErrorCode = 10076
 
+	// JSErrCodeStreamWrongLastSequenceConstant is returned instead of
+	// JSErrCodeStreamWrongLastSequence for CAS conflicts on replicated (R>1)
+	// streams. The two are equivalent "wrong last sequence" responses.
+	JSErrCodeStreamWrongLastSequenceConstant ErrorCode = 10164
+
 	JSErrCodeConsumerAlreadyExists ErrorCode = 10105
 
 	JSErrCodeDuplicateFilterSubjects   ErrorCode = 10136
@@ -65,6 +70,17 @@ const (
 	JSErrCodeConsumerEmptyFilter       ErrorCode = 10139
 	JSErrCodeConsumerExists            ErrorCode = 10148
 	JSErrCodeConsumerDoesNotExist      ErrorCode = 10149
+
+	JSErrCodeMirrorWithMsgSchedules   ErrorCode = 10186
+	JSErrCodeSourceWithMsgSchedules   ErrorCode = 10187
+	JSErrCodeMessageSchedulesDisabled ErrorCode = 10188
+	JSErrCodeSchedulePatternInvalid   ErrorCode = 10189
+	JSErrCodeScheduleTargetInvalid    ErrorCode = 10190
+	JSErrCodeScheduleTTLInvalid       ErrorCode = 10191
+	JSErrCodeScheduleRollupInvalid    ErrorCode = 10192
+	JSErrCodeScheduleSourceInvalid    ErrorCode = 10203
+
+	JSErrCodeConsumerInvalidReset ErrorCode = 10204
 )
 
 var (
@@ -124,6 +140,12 @@ var (
 	// the consumer may not have been created successfully.
 	ErrConsumerCreationResponseEmpty JetStreamError = &jsError{message: "consumer creation response is empty"}
 
+	// ErrInvalidJetStreamResponse is returned when the response from the server
+	// to a JetStream API call (stream CRUD, message get, etc.) does not contain
+	// the expected data payload. The operation may or may not have succeeded on
+	// the server side.
+	ErrInvalidJetStreamResponse JetStreamError = &jsError{message: "invalid jetstream api response"}
+
 	// ErrConsumerExists is returned when attempting to create a consumer with
 	// CreateConsumer but a consumer with given name already exists.
 	ErrConsumerExists JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeConsumerExists, Description: "consumer already exists", Code: 400}}
@@ -131,6 +153,17 @@ var (
 	// ErrConsumerNameExists is returned when attempting to update a consumer
 	// with UpdateConsumer but a consumer with given name does not exist.
 	ErrConsumerDoesNotExist JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeConsumerDoesNotExist, Description: "consumer does not exist", Code: 400}}
+
+	// ErrConsumerResetResponseEmpty is returned when the response from the
+	// server to a consumer reset request is missing the ConsumerInfo
+	// payload. The reset may or may not have taken effect.
+	ErrConsumerResetResponseEmpty JetStreamError = &jsError{message: "consumer reset response is empty"}
+
+	// ErrConsumerInvalidReset is returned when ResetConsumerToSequence is
+	// called with a sequence that violates the consumer's DeliverPolicy
+	// constraints (e.g. seq below OptStartSeq, or non-zero seq with a
+	// DeliverPolicy other than all/by-start-sequence/by-start-time).
+	ErrConsumerInvalidReset JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeConsumerInvalidReset, Description: "invalid reset", Code: 400}}
 
 	// ErrMsgNotFound is returned when message with provided sequence number
 	// does not exist.
@@ -157,6 +190,38 @@ var (
 
 	// ErrEmptyFilter is returned when a filter in FilterSubjects is empty.
 	ErrEmptyFilter JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeConsumerEmptyFilter, Description: "consumer filter in FilterSubjects cannot be empty", Code: 500}}
+
+	// ErrScheduleTargetInvalid is returned when publishing a scheduled
+	// message without a valid target subject.
+	ErrScheduleTargetInvalid JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeScheduleTargetInvalid, Description: "message schedules target is invalid", Code: 400}}
+
+	// ErrSchedulePatternInvalid is returned when the schedule expression
+	// is not a valid @at, @every, or cron pattern.
+	ErrSchedulePatternInvalid JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeSchedulePatternInvalid, Description: "message schedules pattern is invalid", Code: 400}}
+
+	// ErrMessageSchedulesDisabled is returned when publishing a scheduled
+	// message to a stream that does not have AllowMsgSchedules enabled.
+	ErrMessageSchedulesDisabled JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeMessageSchedulesDisabled, Description: "message schedules is disabled", Code: 400}}
+
+	// ErrScheduleSourceInvalid is returned when the schedule source
+	// subject is invalid.
+	ErrScheduleSourceInvalid JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeScheduleSourceInvalid, Description: "message schedules source is invalid", Code: 400}}
+
+	// ErrScheduleTTLInvalid is returned when the schedule TTL value
+	// is not a valid duration or "never".
+	ErrScheduleTTLInvalid JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeScheduleTTLInvalid, Description: "message schedules invalid per-message TTL", Code: 400}}
+
+	// ErrScheduleRollupInvalid is returned when a scheduled message
+	// has an invalid rollup configuration.
+	ErrScheduleRollupInvalid JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeScheduleRollupInvalid, Description: "message schedules invalid rollup", Code: 400}}
+
+	// ErrMirrorWithMsgSchedules is returned when attempting to enable
+	// message scheduling on a mirror stream.
+	ErrMirrorWithMsgSchedules JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeMirrorWithMsgSchedules, Description: "stream mirrors can not also schedule messages", Code: 400}}
+
+	// ErrSourceWithMsgSchedules is returned when attempting to enable
+	// message scheduling on a stream with sources.
+	ErrSourceWithMsgSchedules JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeSourceWithMsgSchedules, Description: "stream source can not also schedule messages", Code: 400}}
 
 	// Client errors
 
@@ -319,7 +384,20 @@ var (
 
 	// ErrKeyExists is returned when attempting to create a key that already
 	// exists.
+	//
+	// Note: ErrKeyExists matches errors by code 10071, which CAS conflicts
+	// from Update/Delete/Purge also carry on non-replicated streams;
+	// replicated (R>1) streams report code 10164 instead and will not match.
+	// Do not use ErrKeyExists to detect revision conflicts - use
+	// ErrKeyRevisionMismatch.
 	ErrKeyExists JetStreamError = &jsError{apiErr: &APIError{ErrorCode: JSErrCodeStreamWrongLastSequence, Code: 400}, message: "key exists"}
+
+	// ErrKeyRevisionMismatch is returned by Update, and by Delete/Purge when
+	// the LastRevision option is used, if the provided revision does not
+	// match the key's current revision (an optimistic-concurrency conflict).
+	// Replicated (R>1) streams report this as error code 10164 instead of
+	// 10071; both map to this error.
+	ErrKeyRevisionMismatch JetStreamError = &jsError{message: "key revision mismatch"}
 
 	// ErrKeyValueConfigRequired is returned when attempting to create a bucket
 	// without a config.

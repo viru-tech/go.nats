@@ -3,7 +3,6 @@ package nats
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -43,13 +42,11 @@ func TestProducer_ProduceJSON(t *testing.T) {
 					logger:              logger,
 					publishTimeout:      time.Second,
 					fallbackTimeout:     time.Second,
-					ackConcurrency:      1,
 					fallbackConcurrency: 1,
-					ackCh:               make(chan pubAckWithTime, 2),
 					fallbackCh:          make(chan fallbackRequest, 2),
+					closedCh:            make(chan struct{}),
 					fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
 				}
-				p.runAckWorker()
 				defer p.Close() //nolint:errcheck
 				p.runFallbackWorker()
 
@@ -94,13 +91,11 @@ func TestProducer_ProduceJSON(t *testing.T) {
 					logger:              logger,
 					publishTimeout:      time.Second,
 					fallbackTimeout:     time.Second,
-					ackConcurrency:      1,
 					fallbackConcurrency: 1,
-					ackCh:               make(chan pubAckWithTime, 2),
 					fallbackCh:          make(chan fallbackRequest, 2),
+					closedCh:            make(chan struct{}),
 					fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
 				}
-				p.runAckWorker()
 				defer p.Close() //nolint:errcheck
 				p.runFallbackWorker()
 
@@ -127,87 +122,142 @@ func TestProducer_ProduceJSON(t *testing.T) {
 func TestProducer_ProduceJSONAsync(t *testing.T) {
 	t.Parallel()
 
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	fb := NewMockFallback(ctrl)
-	js := NewMockJetStream(ctrl)
-	pa := NewMockPubAckFuture(ctrl)
-	logger := zaptest.NewLogger(t)
-
-	msg := []byte(`{"key":"value"}`)
-
-	p := &Producer{
-		js:              js,
-		fallback:        fb,
-		logger:          logger,
-		publishTimeout:  time.Second,
-		fallbackTimeout: time.Second,
-
-		ackConcurrency:      1,
-		fallbackConcurrency: 1,
-		ackCh:               make(chan pubAckWithTime, 2),
-		fallbackCh:          make(chan fallbackRequest, 2),
-		fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
-	}
-	p.runAckWorker()
-	p.runFallbackWorker()
-
-	ackChan := make(chan *jetstream.PubAck, 1)
-	errChan := make(chan error, 1)
-
-	ack := &jetstream.PubAck{
-		Stream:   "test-stream",
-		Sequence: 1,
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	pa.EXPECT().Msg().Return(&nats.Msg{
-		Subject: subject,
-		Data:    msg,
-	}).AnyTimes()
-
 	t.Run("async publish success", func(t *testing.T) { //nolint:paralleltest
-		js.EXPECT().PublishAsync(subject, msg).Return(pa, nil)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
 
-		pa.EXPECT().Ok().Return(ackChan).Do(func() {
-			defer wg.Done()
-		})
+		fb := NewMockFallback(ctrl)
+		js := NewMockJetStream(ctrl)
+		pa := NewMockPubAckFuture(ctrl)
+		msg := []byte(`{"key":"value"}`)
+		ackChan := make(chan *jetstream.PubAck, 1)
+		errChan := make(chan error)
+		doneCh := make(chan struct{})
+		p := &Producer{
+			js:                  js,
+			fallback:            fb,
+			logger:              zaptest.NewLogger(t),
+			publishTimeout:      time.Second,
+			fallbackTimeout:     time.Second,
+			fallbackConcurrency: 1,
+			fallbackCh:          make(chan fallbackRequest, 2),
+			closedCh:            make(chan struct{}),
+			fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
+			asyncHandler: func(result AsyncPublishResult) {
+				if result.Outcome == AsyncPublishOutcomeAcked {
+					close(doneCh)
+				}
+			},
+		}
+		p.runFallbackWorker()
+		defer p.Close() //nolint:errcheck
+
+		js.EXPECT().CleanupPublisher()
+		js.EXPECT().PublishAsync(subject, msg).Return(pa, nil)
+		pa.EXPECT().Msg().Return(&nats.Msg{Subject: subject, Data: msg}).AnyTimes()
+		pa.EXPECT().Ok().Return(ackChan)
 		pa.EXPECT().Err().Return(errChan)
 
-		ackChan <- ack
+		ackChan <- &jetstream.PubAck{Stream: "test-stream", Sequence: 1}
 
 		err := p.ProduceJSONAsync(subject, map[string]string{"key": "value"})
 		require.NoError(t, err)
-
-		wg.Wait()
+		select {
+		case <-doneCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for acked outcome")
+		}
 	})
 
 	t.Run("async immediate error", func(t *testing.T) { //nolint:paralleltest
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		fb := NewMockFallback(ctrl)
+		js := NewMockJetStream(ctrl)
+		msg := []byte(`{"key":"value"}`)
+		doneCh := make(chan AsyncPublishResult, 1)
+		fallbackDone := make(chan struct{})
+		p := &Producer{
+			js:                  js,
+			fallback:            fb,
+			logger:              zaptest.NewLogger(t),
+			publishTimeout:      time.Second,
+			fallbackTimeout:     time.Second,
+			fallbackConcurrency: 1,
+			fallbackCh:          make(chan fallbackRequest, 2),
+			closedCh:            make(chan struct{}),
+			fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
+			asyncHandler: func(result AsyncPublishResult) {
+				doneCh <- result
+			},
+		}
+		p.runFallbackWorker()
+		defer p.Close() //nolint:errcheck
+
+		js.EXPECT().CleanupPublisher()
 		js.EXPECT().PublishAsync(subject, msg).Return(nil, errors.New("async error"))
 
-		doneCh := make(chan struct{})
 		fb.EXPECT().SaveMessage(gomock.Any(), subject, msg).Return(nil).
 			Do(func(context.Context, string, []byte) {
-				close(doneCh)
+				close(fallbackDone)
 			})
 
 		err := p.ProduceJSONAsync(subject, map[string]string{"key": "value"})
 		require.ErrorContains(t, err, "async error")
 
-		<-doneCh
+		select {
+		case result := <-doneCh:
+			require.Equal(t, AsyncPublishOutcomeFailed, result.Outcome)
+			require.ErrorContains(t, result.Err, "async error")
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for failed outcome")
+		}
+		select {
+		case <-fallbackDone:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for fallback save")
+		}
 	})
 
 	t.Run("async ack error with fallback", func(t *testing.T) { //nolint:paralleltest
-		js.EXPECT().PublishAsync(subject, msg).Return(pa, nil)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
 
+		fb := NewMockFallback(ctrl)
+		js := NewMockJetStream(ctrl)
+		pa := NewMockPubAckFuture(ctrl)
+		msg := []byte(`{"key":"value"}`)
+		ackChan := make(chan *jetstream.PubAck)
+		errChan := make(chan error, 1)
+		doneCh := make(chan AsyncPublishResult, 1)
+		fallbackDone := make(chan struct{})
+		p := &Producer{
+			js:                  js,
+			fallback:            fb,
+			logger:              zaptest.NewLogger(t),
+			publishTimeout:      time.Second,
+			fallbackTimeout:     time.Second,
+			fallbackConcurrency: 1,
+			fallbackCh:          make(chan fallbackRequest, 2),
+			closedCh:            make(chan struct{}),
+			fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
+			asyncHandler: func(result AsyncPublishResult) {
+				doneCh <- result
+			},
+		}
+		p.runFallbackWorker()
+		defer p.Close() //nolint:errcheck
+
+		js.EXPECT().CleanupPublisher()
+		js.EXPECT().PublishAsync(subject, msg).Return(pa, nil)
+		pa.EXPECT().Msg().Return(&nats.Msg{Subject: subject, Data: msg}).AnyTimes()
 		pa.EXPECT().Ok().Return(ackChan)
 		pa.EXPECT().Err().Return(errChan)
 
-		doneCh := make(chan struct{})
 		fb.EXPECT().SaveMessage(gomock.Any(), subject, msg).Return(nil).
 			Do(func(context.Context, string, []byte) {
-				close(doneCh)
+				close(fallbackDone)
 			})
 
 		err := p.ProduceJSONAsync(subject, map[string]string{"key": "value"})
@@ -215,6 +265,128 @@ func TestProducer_ProduceJSONAsync(t *testing.T) {
 
 		errChan <- errors.New("some ack error")
 
-		<-doneCh
+		select {
+		case result := <-doneCh:
+			require.Equal(t, AsyncPublishOutcomeFailed, result.Outcome)
+			require.ErrorContains(t, result.Err, "some ack error")
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for failed outcome")
+		}
+		select {
+		case <-fallbackDone:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for fallback save")
+		}
+	})
+
+	t.Run("async timeout becomes unknown and skips fallback", func(t *testing.T) { //nolint:paralleltest
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		fb := NewMockFallback(ctrl)
+		js := NewMockJetStream(ctrl)
+		pa := NewMockPubAckFuture(ctrl)
+		msg := []byte(`{"key":"value"}`)
+		ackChan := make(chan *jetstream.PubAck)
+		errChan := make(chan error, 1)
+		doneCh := make(chan AsyncPublishResult, 1)
+		p := &Producer{
+			js:                  js,
+			fallback:            fb,
+			logger:              zaptest.NewLogger(t),
+			publishTimeout:      time.Second,
+			fallbackTimeout:     time.Second,
+			fallbackConcurrency: 1,
+			fallbackCh:          make(chan fallbackRequest, 2),
+			closedCh:            make(chan struct{}),
+			fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
+			asyncHandler: func(result AsyncPublishResult) {
+				doneCh <- result
+			},
+		}
+		p.runFallbackWorker()
+		defer p.Close() //nolint:errcheck
+
+		js.EXPECT().CleanupPublisher()
+		js.EXPECT().PublishAsync(subject, msg).Return(pa, nil)
+		pa.EXPECT().Msg().Return(&nats.Msg{Subject: subject, Data: msg}).AnyTimes()
+		pa.EXPECT().Ok().Return(ackChan)
+		pa.EXPECT().Err().Return(errChan)
+
+		err := p.ProduceJSONAsync(subject, map[string]string{"key": "value"})
+		require.NoError(t, err)
+
+		errChan <- jetstream.ErrAsyncPublishTimeout
+
+		select {
+		case result := <-doneCh:
+			require.Equal(t, AsyncPublishOutcomeUnknown, result.Outcome)
+			require.ErrorIs(t, result.Err, jetstream.ErrAsyncPublishTimeout)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for unknown outcome")
+		}
+	})
+
+	t.Run("one unresolved future does not block other async results", func(t *testing.T) { //nolint:paralleltest
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		fb := NewMockFallback(ctrl)
+		js := NewMockJetStream(ctrl)
+		stuckFuture := NewMockPubAckFuture(ctrl)
+		resolvedFuture := NewMockPubAckFuture(ctrl)
+		msg := []byte(`{"key":"value"}`)
+		stuckAckCh := make(chan *jetstream.PubAck)
+		stuckErrCh := make(chan error, 1)
+		resolvedAckCh := make(chan *jetstream.PubAck)
+		resolvedErrCh := make(chan error, 1)
+		resolvedDone := make(chan AsyncPublishResult, 1)
+		p := &Producer{
+			js:                  js,
+			fallback:            fb,
+			logger:              zaptest.NewLogger(t),
+			publishTimeout:      time.Second,
+			fallbackTimeout:     time.Second,
+			fallbackConcurrency: 1,
+			fallbackCh:          make(chan fallbackRequest, 2),
+			closedCh:            make(chan struct{}),
+			fastime:             fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
+			asyncHandler: func(result AsyncPublishResult) {
+				if result.Subject == subject && result.Outcome == AsyncPublishOutcomeUnknown {
+					resolvedDone <- result
+				}
+			},
+		}
+		p.runFallbackWorker()
+		defer p.Close() //nolint:errcheck
+
+		js.EXPECT().CleanupPublisher()
+		js.EXPECT().PublishAsync(subject, msg).Return(stuckFuture, nil)
+		js.EXPECT().PublishAsync(subject, msg).Return(resolvedFuture, nil)
+
+		stuckFuture.EXPECT().Msg().Return(&nats.Msg{Subject: subject, Data: msg}).AnyTimes()
+		stuckFuture.EXPECT().Ok().Return(stuckAckCh).AnyTimes()
+		stuckFuture.EXPECT().Err().Return(stuckErrCh).AnyTimes()
+
+		resolvedFuture.EXPECT().Msg().Return(&nats.Msg{Subject: subject, Data: msg}).AnyTimes()
+		resolvedFuture.EXPECT().Ok().Return(resolvedAckCh)
+		resolvedFuture.EXPECT().Err().Return(resolvedErrCh)
+
+		err := p.ProduceJSONAsync(subject, map[string]string{"key": "value"})
+		require.NoError(t, err)
+		err = p.ProduceJSONAsync(subject, map[string]string{"key": "value"})
+		require.NoError(t, err)
+
+		resolvedErrCh <- nats.ErrDisconnected
+
+		select {
+		case result := <-resolvedDone:
+			require.Equal(t, AsyncPublishOutcomeUnknown, result.Outcome)
+			require.ErrorIs(t, result.Err, nats.ErrDisconnected)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for independent async resolution")
+		}
+
+		stuckErrCh <- jetstream.ErrAsyncPublishTimeout
 	})
 }
