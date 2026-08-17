@@ -21,6 +21,7 @@ import (
 type MockPubAckFuture struct {
 	ctrl     *gomock.Controller
 	recorder *MockPubAckFutureMockRecorder
+	isgomock struct{}
 }
 
 // MockPubAckFutureMockRecorder is the mock recorder for MockPubAckFuture.

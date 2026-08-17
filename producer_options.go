@@ -30,25 +30,32 @@ func WithProducerCompression() ProducerOption {
 	}
 }
 
-// WithAckBufferSize sets the buffer size for messages that can be asynchronously pending.
-func WithAckBufferSize(size int) ProducerOption {
-	return func(p *Producer) {
-		p.ackBufferSize = size
-	}
-}
-
-// WithAckConcurrency sets the number of concurrency for processing ack.
-func WithAckConcurrency(number int) ProducerOption {
-	return func(p *Producer) {
-		p.ackConcurrency = number
-	}
-}
-
 // WithErrorHandler sets the error handler function that will be called
 // when an error is received during asynchronous sending or fallback.
 func WithErrorHandler(handler ErrorHandler) ProducerOption {
 	return func(p *Producer) {
 		p.errorHandler = handler
+	}
+}
+
+// WithAsyncOutcomeHandler sets a structured handler for terminal async publish results.
+func WithAsyncOutcomeHandler(handler AsyncOutcomeHandler) ProducerOption {
+	return func(p *Producer) {
+		p.asyncHandler = handler
+	}
+}
+
+// WithPublishAsyncTimeout sets the maximum time to wait for an async publish acknowledgement.
+func WithPublishAsyncTimeout(t time.Duration) ProducerOption {
+	return func(p *Producer) {
+		p.asyncAckTimeout = t
+	}
+}
+
+// WithPublishAsyncMaxPending sets the maximum number of outstanding async publishes.
+func WithPublishAsyncMaxPending(n int) ProducerOption {
+	return func(p *Producer) {
+		p.asyncMaxPending = n
 	}
 }
 

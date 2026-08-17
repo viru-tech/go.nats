@@ -7,6 +7,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/require"
+	"github.com/viru-tech/fastime/v2"
 	"go.uber.org/mock/gomock"
 	"go.uber.org/zap/zaptest"
 )
@@ -199,7 +200,8 @@ func TestProducerProduceJSONAsync_AppliesBackpressure(t *testing.T) {
 		backPressure: map[string]*backpressureController{
 			"ORDERS": {delay: 0},
 		},
-		ackCh: make(chan pubAckWithTime, 1),
+		fastime:  fastime.New().StartTimerD(t.Context(), time.Millisecond*5),
+		closedCh: make(chan struct{}),
 	}
 
 	msg := []byte(`{"key":"value"}`)

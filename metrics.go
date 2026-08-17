@@ -16,6 +16,9 @@ var (
 	resendSentCounter      *prometheus.CounterVec
 	consumerHandlingTime   *prometheus.HistogramVec
 	producerAckWaitingTime *prometheus.HistogramVec
+	asyncPendingGauge      *prometheus.GaugeVec
+	asyncOutcomeCounter    *prometheus.CounterVec
+	asyncResolutionTime    *prometheus.HistogramVec
 )
 
 // MetricsOpts contains metrics configuration.
@@ -74,6 +77,31 @@ func EnableProducerMetrics(opts ...MetricsOption) {
 		},
 		[]string{"subject", "error"},
 	)
+	asyncPendingGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:        "nats_async_publish_pending",
+			Help:        "Number of async publishes currently awaiting a terminal outcome",
+			ConstLabels: mOpts.ConstLabels,
+		},
+		[]string{"subject"},
+	)
+	asyncOutcomeCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        "nats_async_publish_outcome_total",
+			Help:        "Total number of async publish terminal outcomes by subject and outcome",
+			ConstLabels: mOpts.ConstLabels,
+		},
+		[]string{"subject", "outcome"},
+	)
+	asyncResolutionTime = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:        "nats_async_publish_resolution_duration_seconds",
+			Help:        "Time in seconds to resolve an async publish outcome",
+			ConstLabels: mOpts.ConstLabels,
+			Buckets:     []float64{.05, .1, .2, .3, .5, 1, 2, 3, 5, 10},
+		},
+		[]string{"subject", "outcome"},
+	)
 }
 
 // EnableConsumerMetrics creates a set of consumer metrics and registers on a
@@ -107,6 +135,24 @@ func observeProducerAckWaitingTime(subject string, isError bool, d time.Duration
 		producerAckWaitingTime.
 			WithLabelValues(subject, strconv.FormatBool(isError)).
 			Observe(d.Seconds())
+	}
+}
+
+func incAsyncPublishPending(subject string, delta int) {
+	if asyncPendingGauge != nil {
+		asyncPendingGauge.WithLabelValues(subject).Add(float64(delta))
+	}
+}
+
+func incAsyncPublishOutcomeCounter(subject string, outcome AsyncPublishOutcome) {
+	if asyncOutcomeCounter != nil {
+		asyncOutcomeCounter.WithLabelValues(subject, string(outcome)).Inc()
+	}
+}
+
+func observeAsyncPublishResolutionTime(subject string, outcome AsyncPublishOutcome, d time.Duration) {
+	if asyncResolutionTime != nil {
+		asyncResolutionTime.WithLabelValues(subject, string(outcome)).Observe(d.Seconds())
 	}
 }
 

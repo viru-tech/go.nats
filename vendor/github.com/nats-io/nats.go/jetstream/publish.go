@@ -33,6 +33,8 @@ type (
 	asyncPublisherOpts struct {
 		// For async publish error handling.
 		aecb MsgErrHandler
+		// For async publish ack handling.
+		ackcb MsgAckHandler
 		// Max async pub ack in flight
 		maxpa int
 		// ackTimeout is the max time to wait for an ack.
@@ -50,6 +52,11 @@ type (
 		lastSubjectSeq *uint64       // Expected last sequence for subject
 		lastSubject    string        // Expected subject for last sequence
 		ttl            time.Duration // Message TTL
+		schedule       string        // Schedule expression
+		scheduleTarget string        // Target subject for scheduled messages
+		scheduleSource string        // Source subject for sampling
+		scheduleTTL    string        // TTL for generated messages
+		scheduleTZ     string        // Time zone for cron schedules
 
 		// Publish retries for NoResponders err.
 		retryWait     time.Duration // Retry wait between attempts
@@ -98,6 +105,16 @@ type (
 	// PublishAsync. It will return the original message sent to the server for
 	// possible retransmitting and the error encountered.
 	MsgErrHandler func(JetStream, *nats.Msg, error)
+
+	// MsgAckHandler is used to process asynchronous acks from JetStream
+	// PublishAsync. It will return the original message sent to the server
+	// and the resulting PubAck.
+	//
+	// The handler is invoked synchronously on the ack-processing goroutine,
+	// so it must not block or call methods on the PubAckFuture returned by
+	// the corresponding PublishAsync/PublishMsgAsync call, as doing so may
+	// deadlock.
+	MsgAckHandler func(JetStream, *nats.Msg, *PubAck)
 
 	asyncPublishContext struct {
 		sync.RWMutex
@@ -205,6 +222,21 @@ func (js *jetStream) PublishMsg(ctx context.Context, m *nats.Msg, opts ...Publis
 	if o.ttl > 0 {
 		m.Header.Set(MsgTTLHeader, o.ttl.String())
 	}
+	if o.schedule != "" {
+		m.Header.Set(ScheduleHeader, o.schedule)
+	}
+	if o.scheduleTarget != "" {
+		m.Header.Set(ScheduleTargetHeader, o.scheduleTarget)
+	}
+	if o.scheduleSource != "" {
+		m.Header.Set(ScheduleSourceHeader, o.scheduleSource)
+	}
+	if o.scheduleTTL != "" {
+		m.Header.Set(ScheduleTTLHeader, o.scheduleTTL)
+	}
+	if o.scheduleTZ != "" {
+		m.Header.Set(ScheduleTimeZoneHeader, o.scheduleTZ)
+	}
 
 	var resp *nats.Msg
 	var err error
@@ -294,6 +326,21 @@ func (js *jetStream) PublishMsgAsync(m *nats.Msg, opts ...PublishOpt) (PubAckFut
 	}
 	if o.ttl > 0 {
 		m.Header.Set(MsgTTLHeader, o.ttl.String())
+	}
+	if o.schedule != "" {
+		m.Header.Set(ScheduleHeader, o.schedule)
+	}
+	if o.scheduleTarget != "" {
+		m.Header.Set(ScheduleTargetHeader, o.scheduleTarget)
+	}
+	if o.scheduleSource != "" {
+		m.Header.Set(ScheduleSourceHeader, o.scheduleSource)
+	}
+	if o.scheduleTTL != "" {
+		m.Header.Set(ScheduleTTLHeader, o.scheduleTTL)
+	}
+	if o.scheduleTZ != "" {
+		m.Header.Set(ScheduleTimeZoneHeader, o.scheduleTZ)
 	}
 
 	paf := o.pafRetry
@@ -542,7 +589,11 @@ func (js *jetStream) handleAsyncReply(m *nats.Msg) {
 	if paf.doneCh != nil {
 		paf.doneCh <- paf.ack
 	}
+	cb := js.publisher.asyncPublisherOpts.ackcb
 	js.publisher.Unlock()
+	if cb != nil {
+		cb(js, paf.msg, paf.ack)
+	}
 }
 
 func (js *jetStream) resetPendingAcksOnReconnect() {
